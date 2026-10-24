@@ -3,6 +3,7 @@
 
 Install: python -m pip install numpy scipy pillow
 Run:     python strava_heatmap_to_gpx.py --preview
+QGIS:    python strava_heatmap_to_gpx.py --qgis-vrt
 
 Paste your browser's entire Cookie request-header VALUE below, if required.
 Keep this file private after doing so. The script never prints the cookie.
@@ -16,6 +17,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -29,6 +31,7 @@ from scipy import ndimage as ndi
 
 
 # Paste only the value following "Cookie:" in your browser's request headers.
+# The QGIS plugin supplies this through STRAVA_COOKIE for one child process.
 COOKIE_HEADER = ""
 
 # The two corners from the question, in latitude/longitude order.
@@ -40,6 +43,7 @@ TILE_URL = (
     "{z}/{x}/{y}@2x.png?v=20&missing=empty"
 )
 TILE_PX = 512  # Normalize each @2x tile to 512 pixels before tracing.
+MAX_TILES = 2500  # Guard against accidentally tracing a continent at high zoom.
 GPX_NS = "http://www.topografix.com/GPX/1/1"
 
 
@@ -63,12 +67,15 @@ def download_tile(z: int, x: int, y: int, cache: Path) -> Path:
     if dest.exists() and dest.stat().st_size:
         return dest
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0",
+        "User-Agent": "Mozilla/5.0 (compatible; personal-OSM-tracing/1.0)",
         "Referer": "https://www.strava.com/",
         "Accept": "image/png,image/*;q=0.8",
     }
-    if COOKIE_HEADER.strip():
-        headers["Cookie"] = COOKIE_HEADER.strip()
+    cookie = os.environ.get("STRAVA_COOKIE", COOKIE_HEADER).strip()
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie[7:].strip()
+    if cookie:
+        headers["Cookie"] = cookie
     request = Request(TILE_URL.format(z=z, x=x, y=y), headers=headers)
     for attempt in range(4):
         try:
@@ -85,7 +92,7 @@ def download_tile(z: int, x: int, y: int, cache: Path) -> Path:
             if exc.code in (401, 403):
                 raise RuntimeError(
                     f"Tile access denied (HTTP {exc.code}); paste a current Cookie "
-                    "header value into COOKIE_HEADER while signed in to Strava."
+                    "header value into the plugin or COOKIE_HEADER while signed in to Strava."
                 ) from exc
             if exc.code not in (429, 500, 502, 503, 504):
                 raise RuntimeError(f"Tile {z}/{x}/{y}: HTTP {exc.code}") from exc
@@ -159,6 +166,11 @@ def mosaic(z: int, cache: Path, channel: str, workers: int) -> tuple[np.memmap, 
     tx1, ty1 = math.floor(xe / TILE_PX), math.floor(ys / TILE_PX)
     width, height = (tx1 - tx0 + 1) * TILE_PX, (ty1 - ty0 + 1) * TILE_PX
     jobs = [(x, y) for y in range(ty0, ty1 + 1) for x in range(tx0, tx1 + 1)]
+    if len(jobs) > MAX_TILES:
+        raise ValueError(
+            f"Bounds contain {len(jobs)} tiles at zoom {z} (limit {MAX_TILES}). "
+            "Use a smaller bounding box or lower zoom."
+        )
     print(f"Fetching/caching {len(jobs)} tiles ({tx0}..{tx1}, {ty0}..{ty1})")
     paths: dict[tuple[int, int], Path] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -353,9 +365,86 @@ def save_preview(signal: np.ndarray, skeleton: np.ndarray, path: Path) -> None:
     Image.fromarray(rgb).save(path)
 
 
+def write_qgis_vrt(cache: Path, output: Path, zoom: int, channel: str) -> int:
+    """Make a georeferenced QGIS raster from existing cache without fetching tiles.
+
+    The VRT uses transparent 512-pixel RGBA PNGs and a Web Mercator transform.
+    Keeping PNGs beside the VRT allows QGIS to open it by drag-and-drop.
+    """
+    xw, yn = world_pixel(NORTH, WEST, zoom)
+    xe, ys = world_pixel(SOUTH, EAST, zoom)
+    tx0, ty0 = math.floor(xw / TILE_PX), math.floor(yn / TILE_PX)
+    tx1, ty1 = math.floor(xe / TILE_PX), math.floor(ys / TILE_PX)
+    cols, rows = tx1 - tx0 + 1, ty1 - ty0 + 1
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    converted = cache.resolve() / "qgis_tiles"
+    converted.mkdir(parents=True, exist_ok=True)
+
+    span = 2 * math.pi * 6378137
+    resolution = span / (2**zoom * TILE_PX)
+    west_m = tx0 / 2**zoom * span - span / 2
+    north_m = span / 2 - ty0 / 2**zoom * span
+    vrt = ET.Element("VRTDataset", rasterXSize=str(cols * TILE_PX),
+                     rasterYSize=str(rows * TILE_PX))
+    ET.SubElement(vrt, "SRS").text = "EPSG:3857"
+    ET.SubElement(vrt, "GeoTransform").text = (
+        f"{west_m:.12f}, {resolution:.12f}, 0, "
+        f"{north_m:.12f}, 0, {-resolution:.12f}"
+    )
+    bands = []
+    for band_no, color in enumerate(("Red", "Green", "Blue", "Alpha"), 1):
+        band = ET.SubElement(vrt, "VRTRasterBand", dataType="Byte",
+                             band=str(band_no))
+        ET.SubElement(band, "ColorInterp").text = color
+        bands.append(band)
+    found = 0
+    for y in range(ty0, ty1 + 1):
+        for x in range(tx0, tx1 + 1):
+            source = cache / f"z{zoom}_{x}_{y}.png"
+            if not source.exists():
+                continue  # An absent source stays transparent in the VRT.
+            values = tile_signal(source, channel)
+            alpha = values.copy()
+            # Keep only the requested bbox, including at the outermost tiles.
+            left = math.ceil(xw - x * TILE_PX)
+            right = math.floor(xe - x * TILE_PX)
+            top = math.ceil(yn - y * TILE_PX)
+            bottom = math.floor(ys - y * TILE_PX)
+            alpha[:max(0, top), :] = 0
+            alpha[min(TILE_PX, bottom + 1):, :] = 0
+            alpha[:, :max(0, left)] = 0
+            alpha[:, min(TILE_PX, right + 1):] = 0
+            rgba = np.empty((TILE_PX, TILE_PX, 4), dtype=np.uint8)
+            rgba[:, :, :3] = 255  # white heatmap lines
+            rgba[:, :, 3] = alpha
+            png = converted / source.name
+            Image.fromarray(rgba, "RGBA").save(png)
+            relative = os.path.relpath(png, output.parent).replace("\\", "/")
+            for band_no, band in enumerate(bands, 1):
+                item = ET.SubElement(band, "SimpleSource")
+                ET.SubElement(item, "SourceFilename", relativeToVRT="1").text = relative
+                ET.SubElement(item, "SourceBand").text = str(band_no)
+                ET.SubElement(item, "SrcRect", xOff="0", yOff="0",
+                              xSize=str(TILE_PX), ySize=str(TILE_PX))
+                ET.SubElement(item, "DstRect", xOff=str((x - tx0) * TILE_PX),
+                              yOff=str((y - ty0) * TILE_PX),
+                              xSize=str(TILE_PX), ySize=str(TILE_PX))
+            found += 1
+    if not found:
+        raise RuntimeError(f"No cached z{zoom} tiles found in {cache.resolve()}")
+    ET.indent(vrt, space="  ")
+    ET.ElementTree(vrt).write(output, encoding="utf-8", xml_declaration=True)
+    return found
+
+
 def main() -> int:
+    global NORTH, EAST, SOUTH, WEST
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--bbox", nargs=4, type=float,
+                        metavar=("SOUTH", "WEST", "NORTH", "EAST"),
+                        help="Bounding box in latitude/longitude (default: supplied Sydney box)")
     parser.add_argument("--output", type=Path, default=Path("strava_heatmap_traces.gpx"))
     parser.add_argument("--cache", type=Path, default=Path("strava_tile_cache"))
     parser.add_argument("--zoom", type=int, default=14, choices=range(11, 17))
@@ -370,9 +459,22 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--preview", nargs="?", const="strava_trace_preview.png",
                         help="Save downscaled heatmap with red extracted lines")
+    parser.add_argument("--qgis-vrt", type=Path, nargs="?",
+                        const=Path("strava_heatmap_qgis.vrt"),
+                        help="Create a georeferenced QGIS VRT from cached tiles; no download or tracing")
     args = parser.parse_args()
     if not 1 <= args.threshold <= 255 or not 1 <= args.workers <= 6:
         parser.error("threshold must be 1..255 and workers must be 1..6")
+    if args.bbox:
+        SOUTH, WEST, NORTH, EAST = args.bbox
+        if not (-85.05112878 < SOUTH < NORTH < 85.05112878 and
+                -180 <= WEST < EAST <= 180):
+            parser.error("bbox must be SOUTH WEST NORTH EAST, within Web Mercator limits")
+    if args.qgis_vrt is not None:
+        count = write_qgis_vrt(args.cache, args.qgis_vrt, args.zoom, args.channel)
+        print(f"Wrote {args.qgis_vrt} using {count} cached tiles. Open the VRT "
+              "in QGIS as a raster; keep its qgis_tiles folder with it.")
+        return 0
     signal, origin_x, origin_y = mosaic(args.zoom, args.cache, args.channel, args.workers)
     print(f"Tracing lines at brightness >= {args.threshold} ...", flush=True)
     skeleton = trace_mosaic(signal, args.cache, args.threshold)
