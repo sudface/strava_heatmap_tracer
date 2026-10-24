@@ -3,16 +3,19 @@
 import os
 from pathlib import Path
 import shutil
+from datetime import datetime
+from uuid import uuid4
 
 from qgis.PyQt.QtCore import QProcess, QProcessEnvironment, QTimer
+from qgis.PyQt.QtGui import QPainter
 from qgis.PyQt.QtWidgets import (
     QAction, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 from qgis.core import (
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject,
-    QgsRasterLayer, QgsVectorLayer,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature,
+    QgsGeometry, QgsProject, QgsRasterLayer, QgsVectorLayer,
 )
 
 
@@ -129,7 +132,7 @@ class TraceDialog(QDialog):
         root.addWidget(paths)
 
         self.preview = QCheckBox("Write a red-line preview PNG beside the GPX")
-        self.add_layer = QCheckBox("Add the finished GPX tracks to this project")
+        self.add_layer = QCheckBox("Add GPX tracks as a temporary QGIS layer")
         self.add_layer.setChecked(True)
         self.add_raster = QCheckBox("Add the cached heatmap as a transparent raster layer")
         self.add_raster.setChecked(True)
@@ -228,6 +231,15 @@ class TraceDialog(QDialog):
         if chunk:
             self.log.appendPlainText(chunk)
 
+    @staticmethod
+    def _unique_path(path):
+        """Preserve earlier output files, even if the same area is run again."""
+        candidate = Path(path)
+        if not candidate.exists():
+            return str(candidate)
+        suffix = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:6]
+        return str(candidate.with_name(candidate.stem + "_" + suffix + candidate.suffix))
+
     def run_extraction(self):
         if self.process is not None and self.process.state() != QProcess.NotRunning:
             return
@@ -245,7 +257,10 @@ class TraceDialog(QDialog):
             return
         if not output.lower().endswith(".gpx"):
             output += ".gpx"
-        vrt_path = str(Path(output).with_name(Path(output).stem + "_heatmap.vrt"))
+        output = self._unique_path(output)
+        vrt_path = self._unique_path(
+            str(Path(output).with_name(Path(output).stem + "_heatmap.vrt"))
+        )
         script = os.path.join(os.path.dirname(__file__), "extractor.py")
         arguments = [
             script, "--bbox", str(south), str(west), str(north), str(east),
@@ -277,7 +292,8 @@ class TraceDialog(QDialog):
             return
         output = os.path.abspath(os.path.expanduser(self.output.text().strip())) if self.output.text().strip() else ""
         cache = os.path.abspath(os.path.expanduser(self.cache.text().strip()))
-        vrt_path = str(Path(output).with_name(Path(output).stem + "_heatmap.vrt")) if output else os.path.join(cache, "strava_heatmap.vrt")
+        base = str(Path(output).with_name(Path(output).stem + "_heatmap.vrt")) if output else os.path.join(cache, "strava_heatmap.vrt")
+        vrt_path = self._unique_path(base)
         script = os.path.join(os.path.dirname(__file__), "extractor.py")
         arguments = [
             script, "--bbox", str(south), str(west), str(north), str(east),
@@ -316,6 +332,8 @@ class TraceDialog(QDialog):
             else "Building a QGIS raster from cached tiles; no downloads."
         )
         if mode == "extract":
+            self.log.appendPlainText("GPX output: " + output)
+        if mode == "extract":
             self.cookie.clear()
         self.run_button.setEnabled(False)
         self.cache_button.setEnabled(False)
@@ -353,15 +371,49 @@ class TraceDialog(QDialog):
         if self.current_mode == "extract":
             self.log.appendPlainText("Finished: " + self.current_output)
         if self.should_add_gpx:
-            uri = self.current_output + "?type=track"
-            for layer in list(QgsProject.instance().mapLayers().values()):
-                if isinstance(layer, QgsVectorLayer) and layer.source() == uri:
-                    QgsProject.instance().removeMapLayer(layer.id())
-            layer = QgsVectorLayer(uri, Path(self.current_output).stem, "gpx")
-            if layer.isValid():
-                QgsProject.instance().addMapLayer(layer)
-            else:
-                self.log.appendPlainText("GPX was written but QGIS could not load its track layer.")
+            self._load_temporary_gpx(self.current_output)
+
+    def _load_temporary_gpx(self, path):
+        source = QgsVectorLayer(path + "?type=track", "GPX tracks", "gpx")
+        if not source.isValid():
+            self.log.appendPlainText("GPX was written but QGIS could not read its tracks.")
+            return
+        uri = "MultiLineString?crs=" + (source.crs().authid() or "EPSG:4326")
+        name = "Strava traces " + datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        temporary = QgsVectorLayer(uri, name, "memory")
+        if not temporary.isValid():
+            self.log.appendPlainText("GPX was written but QGIS could not create a temporary layer.")
+            return
+        provider = temporary.dataProvider()
+        provider.addAttributes(list(source.fields()))
+        temporary.updateFields()
+        batch = []
+        count = 0
+        for original in source.getFeatures():
+            geometry = original.geometry()
+            parts = geometry.asMultiPolyline() if geometry.isMultipart() else [geometry.asPolyline()]
+            if not parts or not any(len(part) >= 2 for part in parts):
+                continue
+            feature = QgsFeature(temporary.fields())
+            feature.setGeometry(QgsGeometry.fromMultiPolylineXY(parts))
+            feature.setAttributes(original.attributes())
+            batch.append(feature)
+            if len(batch) >= 500:
+                result, _ = provider.addFeatures(batch)
+                if not result:
+                    self.log.appendPlainText("Could not copy GPX features into temporary layer.")
+                    return
+                count += len(batch)
+                batch.clear()
+        if batch:
+            result, _ = provider.addFeatures(batch)
+            if not result:
+                self.log.appendPlainText("Could not copy GPX features into temporary layer.")
+                return
+            count += len(batch)
+        temporary.updateExtents()
+        QgsProject.instance().addMapLayer(temporary)
+        self.log.appendPlainText(f"Added {count} tracks as a temporary QGIS layer.")
 
     def _load_raster(self, path):
         for layer in list(QgsProject.instance().mapLayers().values()):
@@ -369,6 +421,7 @@ class TraceDialog(QDialog):
                 QgsProject.instance().removeMapLayer(layer.id())
         raster = QgsRasterLayer(path, Path(path).stem, "gdal")
         if raster.isValid():
+            raster.setBlendMode(QPainter.CompositionMode_Screen)
             QgsProject.instance().addMapLayer(raster)
             self.log.appendPlainText("Added cached heatmap raster: " + path)
         else:

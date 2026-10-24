@@ -16,9 +16,16 @@ child process environment for that run; the plugin does not save it.
 
 Check **Add the cached heatmap as a transparent raster layer** to create a
 georeferenced VRT alongside the GPX and load it into QGIS when extraction
-finishes. **Load cached tiles only** builds and loads that layer from tiles
-already on disk, without downloading or tracing. Keep the tile cache folder in
-place: the VRT references PNGs generated inside its `qgis_tiles` subfolder.
+finishes. Heat is displayed as orange lines with a screen blend mode. **Load
+cached tiles only** builds and loads that layer from tiles already on disk,
+without downloading or tracing. Each VRT references its own neighbouring
+`*_tiles` folder, so later runs do not change an earlier raster.
+
+The GPX is copied into a QGIS **temporary memory layer**, which is independent
+of the GPX file. If the chosen GPX output filename already exists, a timestamp
+and short unique suffix are added so existing files remain intact. Temporary
+QGIS vector layers are not persistent across QGIS restarts; export any you want
+to keep. Keep a VRT and its `*_tiles` folder together if moving the raster.
 
 The output is an inferred centerline network from an aggregate image. It
 includes roads as well as paths and may include off-trail use or GPS errors.

@@ -369,8 +369,9 @@ def save_preview(signal: np.ndarray, skeleton: np.ndarray, path: Path) -> None:
 def write_qgis_vrt(cache: Path, output: Path, zoom: int, channel: str) -> int:
     """Make a georeferenced QGIS raster from existing cache without fetching tiles.
 
-    The VRT uses transparent 512-pixel RGBA PNGs and a Web Mercator transform.
-    Keeping PNGs beside the VRT allows QGIS to open it by drag-and-drop.
+    Each VRT gets its own set of transparent orange 512-pixel PNGs. Empty pixels
+    have black RGB as well as zero alpha, so ignoring alpha cannot make an
+    opaque white sheet. Its sources remain stable across subsequent runs.
     """
     xw, yn = world_pixel(NORTH, WEST, zoom)
     xe, ys = world_pixel(SOUTH, EAST, zoom)
@@ -379,7 +380,7 @@ def write_qgis_vrt(cache: Path, output: Path, zoom: int, channel: str) -> int:
     cols, rows = tx1 - tx0 + 1, ty1 - ty0 + 1
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    converted = cache.resolve() / "qgis_tiles"
+    converted = output.parent / (output.stem + "_tiles")
     converted.mkdir(parents=True, exist_ok=True)
 
     span = 2 * math.pi * 6378137
@@ -416,9 +417,11 @@ def write_qgis_vrt(cache: Path, output: Path, zoom: int, channel: str) -> int:
             alpha[min(TILE_PX, bottom + 1):, :] = 0
             alpha[:, :max(0, left)] = 0
             alpha[:, min(TILE_PX, right + 1):] = 0
-            rgba = np.empty((TILE_PX, TILE_PX, 4), dtype=np.uint8)
-            rgba[:, :, :3] = 255  # white heatmap lines
-            rgba[:, :, 3] = alpha
+            strength = np.minimum(alpha.astype(np.uint16) * 3, 255).astype(np.uint8)
+            rgba = np.zeros((TILE_PX, TILE_PX, 4), dtype=np.uint8)
+            rgba[:, :, 0] = strength
+            rgba[:, :, 1] = strength // 3
+            rgba[:, :, 3] = strength
             png = converted / source.name
             Image.fromarray(rgba, "RGBA").save(png)
             relative = os.path.relpath(png, output.parent).replace("\\", "/")
