@@ -421,7 +421,7 @@ class TraceDialog(QDialog):
                 QgsProject.instance().removeMapLayer(layer.id())
         raster = QgsRasterLayer(path, Path(path).stem, "gdal")
         if raster.isValid():
-            raster.setBlendMode(QPainter.CompositionMode_Screen)
+            # raster.setBlendMode(QPainter.CompositionMode_Screen)
             QgsProject.instance().addMapLayer(raster)
             self.log.appendPlainText("Added cached heatmap raster: " + path)
         else:
