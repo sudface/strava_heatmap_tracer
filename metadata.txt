@@ -2,7 +2,7 @@
 name=Strava Heatmap Tracer
 description=Trace Strava heatmap lines inside a chosen bounding box into GPX tracks.
 about=Runs the bundled heatmap extractor using a configurable Python interpreter. The cookie is passed only to the extraction process and is not saved. Generated lines are inferred from aggregated heatmap imagery and require review.
-version=0.1.0
+version=0.2.0
 qgisMinimumVersion=3.28
 author=Personal use
 category=Vector

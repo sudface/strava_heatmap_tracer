@@ -4,6 +4,7 @@
 Install: python -m pip install numpy scipy pillow
 Run:     python strava_heatmap_to_gpx.py --preview
 QGIS:    python strava_heatmap_to_gpx.py --qgis-vrt
+Both:    python strava_heatmap_to_gpx.py --qgis-vrt-after strava_heatmap_qgis.vrt
 
 Paste your browser's entire Cookie request-header VALUE below, if required.
 Keep this file private after doing so. The script never prints the cookie.
@@ -462,6 +463,8 @@ def main() -> int:
     parser.add_argument("--qgis-vrt", type=Path, nargs="?",
                         const=Path("strava_heatmap_qgis.vrt"),
                         help="Create a georeferenced QGIS VRT from cached tiles; no download or tracing")
+    parser.add_argument("--qgis-vrt-after", type=Path,
+                        help="After GPX extraction, also create a transparent heatmap VRT")
     args = parser.parse_args()
     if not 1 <= args.threshold <= 255 or not 1 <= args.workers <= 6:
         parser.error("threshold must be 1..255 and workers must be 1..6")
@@ -486,6 +489,9 @@ def main() -> int:
     count, total = write_gpx(lines, args.output, origin_x, origin_y, args.zoom,
                              args.min_length_m, args.simplify_m)
     print(f"Wrote {count} segments, ~{total/1000:.1f} km total, to {args.output}")
+    if args.qgis_vrt_after is not None:
+        tiles = write_qgis_vrt(args.cache, args.qgis_vrt_after, args.zoom, args.channel)
+        print(f"Wrote heatmap raster {args.qgis_vrt_after} from {tiles} cached tiles", flush=True)
     if not count:
         print("No lines found. Check the preview; try --threshold 20 or --channel alpha.",
               file=sys.stderr)

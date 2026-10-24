@@ -10,7 +10,10 @@ from qgis.PyQt.QtWidgets import (
     QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
-from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject, QgsVectorLayer
+from qgis.core import (
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject,
+    QgsRasterLayer, QgsVectorLayer,
+)
 
 
 class StravaHeatmapTracer:
@@ -48,6 +51,10 @@ class TraceDialog(QDialog):
         self.process = None
         self.was_cancelled = False
         self.current_output = ""
+        self.current_vrt = ""
+        self.current_mode = "extract"
+        self.should_add_gpx = True
+        self.should_add_raster = False
         self.setWindowTitle("Strava Heatmap Tracer")
         self.setMinimumWidth(620)
         self.resize(680, 670)
@@ -124,8 +131,11 @@ class TraceDialog(QDialog):
         self.preview = QCheckBox("Write a red-line preview PNG beside the GPX")
         self.add_layer = QCheckBox("Add the finished GPX tracks to this project")
         self.add_layer.setChecked(True)
+        self.add_raster = QCheckBox("Add the cached heatmap as a transparent raster layer")
+        self.add_raster.setChecked(True)
         root.addWidget(self.preview)
         root.addWidget(self.add_layer)
+        root.addWidget(self.add_raster)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -134,12 +144,15 @@ class TraceDialog(QDialog):
         buttons = QHBoxLayout()
         self.run_button = QPushButton("Run extraction")
         self.run_button.clicked.connect(self.run_extraction)
+        self.cache_button = QPushButton("Load cached tiles only")
+        self.cache_button.clicked.connect(self.run_cached_tiles)
         self.cancel_button = QPushButton("Cancel run")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_run)
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.close)
         buttons.addWidget(self.run_button)
+        buttons.addWidget(self.cache_button)
         buttons.addWidget(self.cancel_button)
         buttons.addStretch()
         buttons.addWidget(close_button)
@@ -232,6 +245,7 @@ class TraceDialog(QDialog):
             return
         if not output.lower().endswith(".gpx"):
             output += ".gpx"
+        vrt_path = str(Path(output).with_name(Path(output).stem + "_heatmap.vrt"))
         script = os.path.join(os.path.dirname(__file__), "extractor.py")
         arguments = [
             script, "--bbox", str(south), str(west), str(north), str(east),
@@ -245,9 +259,39 @@ class TraceDialog(QDialog):
         ]
         if self.preview.isChecked():
             arguments += ["--preview", str(Path(output).with_name(Path(output).stem + "_preview.png"))]
+        if self.add_raster.isChecked():
+            arguments += ["--qgis-vrt-after", vrt_path]
+        self._start_process(python, arguments, output, vrt_path, "extract", self.cookie.text())
+
+    def run_cached_tiles(self):
+        if self.process is not None and self.process.state() != QProcess.NotRunning:
+            return
+        south, west, north, east = (
+            self.south.value(), self.west.value(), self.north.value(), self.east.value()
+        )
+        if not (south < north and west < east):
+            QMessageBox.warning(self, "Invalid bounds", "South must be below north; west must be left of east.")
+            return
+        if not self.cache.text().strip() or not self.python.text().strip():
+            QMessageBox.warning(self, "Missing path", "Choose a tile cache and Python executable.")
+            return
+        output = os.path.abspath(os.path.expanduser(self.output.text().strip())) if self.output.text().strip() else ""
+        cache = os.path.abspath(os.path.expanduser(self.cache.text().strip()))
+        vrt_path = str(Path(output).with_name(Path(output).stem + "_heatmap.vrt")) if output else os.path.join(cache, "strava_heatmap.vrt")
+        script = os.path.join(os.path.dirname(__file__), "extractor.py")
+        arguments = [
+            script, "--bbox", str(south), str(west), str(north), str(east),
+            "--cache", cache, "--zoom", str(self.zoom.value()),
+            "--channel", self.channel.currentText(),
+            "--qgis-vrt", vrt_path,
+        ]
+        self._start_process(self.python.text().strip().strip('"'), arguments,
+                            "", vrt_path, "raster", "")
+
+    def _start_process(self, python, arguments, output, vrt_path, mode, cookie):
         process = QProcess(self)
         env = QProcessEnvironment.systemEnvironment()
-        env.insert("STRAVA_COOKIE", self.cookie.text())
+        env.insert("STRAVA_COOKIE", cookie)
         process.setProcessEnvironment(env)
         process.setProgram(python)
         process.setArguments(arguments)
@@ -262,10 +306,19 @@ class TraceDialog(QDialog):
         self.process = process
         self.was_cancelled = False
         self.current_output = output
+        self.current_vrt = vrt_path
+        self.current_mode = mode
+        self.should_add_gpx = self.add_layer.isChecked() and mode == "extract"
+        self.should_add_raster = self.add_raster.isChecked() or mode == "raster"
         self.log.clear()
-        self.log.appendPlainText("Starting extraction. Cached tiles will be reused.")
-        self.cookie.clear()
+        self.log.appendPlainText(
+            "Starting extraction. Cached tiles will be reused." if mode == "extract"
+            else "Building a QGIS raster from cached tiles; no downloads."
+        )
+        if mode == "extract":
+            self.cookie.clear()
         self.run_button.setEnabled(False)
+        self.cache_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         process.start()
 
@@ -281,6 +334,7 @@ class TraceDialog(QDialog):
         self._append_log(process.readAllStandardOutput())
         self._append_log(process.readAllStandardError())
         self.run_button.setEnabled(True)
+        self.cache_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         # Remove the short-lived cookie environment from the QProcess object.
         process.setProcessEnvironment(QProcessEnvironment.systemEnvironment())
@@ -291,11 +345,14 @@ class TraceDialog(QDialog):
             return
         if status != QProcess.NormalExit or code != 0:
             self.log.appendPlainText(
-                "Extraction failed. Check the log, cookie, and that this Python has numpy, scipy and pillow."
+                "Operation failed. Check the log, cache, cookie, and that this Python has numpy, scipy and pillow."
             )
             return
-        self.log.appendPlainText("Finished: " + self.current_output)
-        if self.add_layer.isChecked():
+        if self.should_add_raster:
+            self._load_raster(self.current_vrt)
+        if self.current_mode == "extract":
+            self.log.appendPlainText("Finished: " + self.current_output)
+        if self.should_add_gpx:
             uri = self.current_output + "?type=track"
             for layer in list(QgsProject.instance().mapLayers().values()):
                 if isinstance(layer, QgsVectorLayer) and layer.source() == uri:
@@ -305,6 +362,17 @@ class TraceDialog(QDialog):
                 QgsProject.instance().addMapLayer(layer)
             else:
                 self.log.appendPlainText("GPX was written but QGIS could not load its track layer.")
+
+    def _load_raster(self, path):
+        for layer in list(QgsProject.instance().mapLayers().values()):
+            if isinstance(layer, QgsRasterLayer) and layer.source() == path:
+                QgsProject.instance().removeMapLayer(layer.id())
+        raster = QgsRasterLayer(path, Path(path).stem, "gdal")
+        if raster.isValid():
+            QgsProject.instance().addMapLayer(raster)
+            self.log.appendPlainText("Added cached heatmap raster: " + path)
+        else:
+            self.log.appendPlainText("VRT was written but QGIS could not load it: " + path)
 
     def cancel_run(self):
         if self.process is None or self.process.state() == QProcess.NotRunning:
