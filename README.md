@@ -1,7 +1,7 @@
 # Strava Heatmap Tracer + QGIS Integration
 
 ## The Strava Heatmap
-The Strava heatmap 'heat' made by aggregated, public activities recorded on Strava over the past year, updated monthly. It can contain data not present in mapping datasets for a variety of reasons including:
+The Strava heatmap displays 'heat' made by aggregated, public activities recorded on Strava over the past year, updated monthly. It can contain data not present in mapping datasets for a variety of reasons including:
 * The track is for private use only
 * The route is a common off-track corridor and not a physical track on the ground
 * A single person is very committed to riding that route twice a day, every day
@@ -31,6 +31,8 @@ Image of the simple scraped tiles from Strava, loaded into QGIS:
 
 Image of the inferred GPS lines along the heatmap corridors:
 ![alt text](./screenshots/qgis_gpxExtract.jpg)
+
+After usage is complete, you should go and clear the temp directories used to cache the downloaded tiles.
 
 ## QGIS Plugin
 
