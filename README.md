@@ -34,6 +34,9 @@ Image of the inferred GPS lines along the heatmap corridors:
 
 ## QGIS Plugin
 
+Add this entire repo directory into a zipfile. Ie. The Zipfile should contain a directory, containing all the contents.
+Or, download the zipfile from [Releases](https://github.com/sudface/strava_heatmap_tracer/releases).
+
 Install the ZIP through **Plugins → Manage and Install Plugins → Install from ZIP**.
 Open **Plugins → Strava Heatmap Tracer → Trace Strava heatmap…**.
 
