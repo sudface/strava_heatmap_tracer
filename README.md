@@ -73,6 +73,8 @@ Open that row and scroll to "Cookie" in the "Request Headers" section. Copy that
 
 That is the value you need to paste into the plugin.
 
+You may also try your luck with the [zekefarwell/josm-strava-heatmap](https://github.com/zekefarwell/josm-strava-heatmap) browser extension to extract the cookie for you. I have not tested this, but it may work.
+
 ## Credits and License
 
 This code is released with no guarantee and under the [Unlicense](https://unlicense.org/). 
